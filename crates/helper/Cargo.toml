@@ -1,0 +1,10 @@
+[package]
+name = "oxi-boot-helper"
+description = "Runs in a booted ISO's early-boot image and reattaches the ISO over the network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Ships inside every patched initrd: keep this dependency-free.
+[dependencies]

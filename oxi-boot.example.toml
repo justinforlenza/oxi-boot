@@ -1,0 +1,16 @@
+[server]
+interface = "eth0"
+iso_dir = "/srv/iso"
+
+[dhcp]
+mode = "proxy"   # proxy | full | external
+range = "192.168.1.100-192.168.1.200"  # full mode only
+
+[menu]
+timeout = 10       # seconds, 0 = wait forever
+default = "local"
+
+[access]
+policy = "allow"   # what unknown machines get
+deny = ["aa:bb:cc:dd:ee:ff"]
+allow = []
