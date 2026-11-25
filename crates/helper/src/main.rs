@@ -1,13 +1,21 @@
 //! Runs as /init in a patched initrd, before the ISO's own first program:
 //! loads the network driver, gets an address, attaches the untouched ISO as
-//! /dev/nbd0 (a child process answers the kernel's block reads with HTTP
-//! range requests to the server), then hands over to the original /init.
+//! a block device, then hands over to the original /init.
+//!
+//! Three ways to attach, tried in this order:
+//! 1. NBD: a child process answers the kernel's block reads on /dev/nbd0
+//!    with HTTP range requests to the server.
+//! 2. FUSE: a child process serves the ISO as a file the same way, and a
+//!    loop device sits on that file. For kernels without NBD.
+//! 3. RAM: the whole ISO is downloaded into memory, under a loop device.
+//!    Needs no driver but loop, and more free memory than the ISO's size.
 //!
 //! It must run in any initrd, so it is one static program:
 //! cargo build --release --target x86_64-unknown-linux-musl -p oxi-boot-helper
 //!
 //! The server puts /oxi-boot.conf beside it: the server's "address:port" on
-//! the first line and the ISO's URL path on the second.
+//! the first line, the ISO's URL path on the second, and optionally the way
+//! to attach to start from ("nbd", "fuse" or "ram") on the third.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -25,8 +33,14 @@ const SERVER_NAME: &str = "@oxi-boot-helper";
 
 fn main() {
     if std::env::args().next().as_deref() == Some(SERVER_NAME) {
-        let e = serve_nbd().unwrap_err();
-        log(format!("NBD server stopped: {e}"));
+        if let Ok(net) = std::env::var("OXI_NET") {
+            thread::spawn(move || keep_network(&net));
+        }
+        let e = match std::env::var("OXI_MODE").as_deref() {
+            Ok("fuse") => serve_fuse().unwrap_err(),
+            _ => serve_nbd().unwrap_err(),
+        };
+        log(format!("ISO server stopped: {e}"));
         return;
     }
     log("helper started".to_string());
@@ -46,7 +60,7 @@ fn main() {
         unsafe { libc::umount2(dir.as_ptr(), libc::MNT_DETACH) };
     }
     match attached {
-        Ok(()) => log("ISO attached as /dev/nbd0, starting the installer's own init".to_string()),
+        Ok(device) => log(format!("ISO attached as {device}, starting the installer's own init")),
         Err(e) => log(format!("could not attach the ISO ({e}), continuing without it")),
     }
     // Put the original first program back so it sees nothing unusual.
@@ -60,7 +74,7 @@ fn main() {
 /// console is often unreadable or hidden behind a splash screen.
 fn log(message: String) {
     eprintln!("oxi-boot: {message}");
-    let Ok((host, _)) = server() else { return };
+    let Ok((host, ..)) = server() else { return };
     let Ok(address) = host.parse() else { return };
     if let Ok(mut s) = TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
         let text: String = message.chars().map(|c| if c.is_ascii_alphanumeric() || "/.:-".contains(c) { c } else { '_' }).collect();
@@ -69,17 +83,19 @@ fn log(message: String) {
     }
 }
 
-/// The server's "address:port" and the untouched ISO's URL path.
-fn server() -> io::Result<(String, String)> {
+/// The server's "address:port", the untouched ISO's URL path, and the way to
+/// attach to start from.
+fn server() -> io::Result<(String, String, String)> {
     let conf = fs::read_to_string("/oxi-boot.conf")?;
     let mut lines = conf.lines().map(|line| line.trim().to_string());
     match (lines.next(), lines.next()) {
-        (Some(host), Some(path)) => Ok((host, path)),
+        (Some(host), Some(path)) => Ok((host, path, lines.next().unwrap_or_default())),
         _ => Err(io::Error::other("/oxi-boot.conf is incomplete")),
     }
 }
 
-fn attach() -> io::Result<()> {
+/// Attaches the ISO and returns the device it is on.
+fn attach() -> io::Result<String> {
     // Set by the server when it added kernel modules to the initrd (Debian's
     // installer ships none for networking): index them so modprobe finds them.
     if Path::new("/oxi-boot.depmod").exists() {
@@ -93,8 +109,6 @@ fn attach() -> io::Result<()> {
             modprobe(read("modalias").trim());
         }
     }
-    modprobe("nbd");
-
     let interface = retry(100, || {
         fs::read_dir("/sys/class/net").ok()?.flatten().map(|e| e.file_name().into_string().unwrap()).find(|n| n != "lo")
     })
@@ -104,12 +118,130 @@ fn attach() -> io::Result<()> {
     let mac = fs::read_to_string(format!("/sys/class/net/{interface}/address"))?;
     log(format!("{interface} is {address}, server is {}", server()?.0));
 
-    Command::new("/proc/self/exe")
-        .arg0(SERVER_NAME)
-        .env("OXI_NET", format!("{} {address} {}", mac.trim(), Ipv4Addr::from(mask)))
-        .spawn()?;
+    let net = format!("{} {address} {}", mac.trim(), Ipv4Addr::from(mask));
+    let ways: &[&str] = match server()?.2.as_str() {
+        "ram" => &["ram"],
+        "fuse" => &["fuse", "ram"],
+        _ => &["nbd", "fuse", "ram"],
+    };
+    for way in ways {
+        let attached = match *way {
+            "nbd" => attach_nbd(&net),
+            "fuse" => attach_fuse(&net),
+            _ => attach_ram(),
+        };
+        match attached {
+            Ok(device) => {
+                name_live_medium(&device);
+                return Ok(device);
+            }
+            Err(e) => log(format!("attaching by {way} did not work: {e}")),
+        }
+    }
+    Err(io::Error::other("no way left to attach the ISO"))
+}
+
+/// Ubuntu's (casper) and Debian live's (live-boot) scripts search every
+/// drive for the live system but skip loop devices. Both read a config file
+/// that names the drive to use, so when the ISO is on a loop device, say so.
+fn name_live_medium(device: &str) {
+    if !device.starts_with("/dev/loop") {
+        return;
+    }
+    if Path::new("/scripts/casper").exists() {
+        let _ = fs::OpenOptions::new().append(true).create(true).open("/etc/casper.conf").and_then(|mut f| writeln!(f, "export LIVEMEDIA=\"{device}\""));
+    }
+    if Path::new("/bin/live-boot").exists() {
+        let _ = fs::create_dir_all("/etc/live/boot").and_then(|()| fs::write("/etc/live/boot/oxi-boot.conf", format!("LIVE_MEDIA=\"{device}\"\n")));
+    }
+}
+
+/// Starts this program again as the long-lived process that serves the ISO.
+fn spawn_server(mode: &str, net: &str) -> io::Result<()> {
+    Command::new("/proc/self/exe").arg0(SERVER_NAME).env("OXI_MODE", mode).env("OXI_NET", net).spawn().map(drop)
+}
+
+fn attach_nbd(net: &str) -> io::Result<String> {
+    modprobe("nbd");
+    if !Path::new("/sys/block/nbd0").exists() {
+        return Err(io::Error::other("this kernel has no NBD driver"));
+    }
+    spawn_server("nbd", net)?;
     retry(300, || (fs::read_to_string("/sys/block/nbd0/size").ok()?.trim() != "0").then_some(()))
-        .ok_or_else(|| io::Error::other("/dev/nbd0 did not come up"))
+        .ok_or_else(|| io::Error::other("/dev/nbd0 did not come up"))?;
+    Ok("/dev/nbd0".into())
+}
+
+const FUSE_DIR: &str = "/oxi-boot-iso";
+const RAM_DIR: &str = "/oxi-boot-ram";
+
+fn attach_fuse(net: &str) -> io::Result<String> {
+    modprobe("fuse");
+    if !Path::new("/dev/fuse").exists() {
+        return Err(io::Error::other("this kernel has no FUSE driver"));
+    }
+    fs::create_dir_all(FUSE_DIR)?;
+    spawn_server("fuse", net)?;
+    loop_control()?;
+    let file = format!("{FUSE_DIR}/iso");
+    retry(100, || Path::new(&file).exists().then_some(())).ok_or_else(|| io::Error::other("the FUSE file system did not come up"))?;
+    loop_device(&file)
+}
+
+/// Downloads the whole ISO into memory. The last resort: it needs no driver
+/// but loop, and the machine must have the memory.
+fn attach_ram() -> io::Result<String> {
+    loop_control()?; // before the long download, not after
+    let (host, path, _) = server()?;
+    let mut http = Http { host, path, connection: None };
+    let size = http.fetch("HEAD", 0, 0).0;
+    let meminfo = fs::read_to_string("/proc/meminfo")?;
+    let free_kb: u64 = meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:")?.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0);
+    // Room for the ISO, plus what the booted system needs to run at all.
+    let (need_mb, free_mb) = (size / (1 << 20) + 512, free_kb / 1024);
+    if free_mb < need_mb {
+        return Err(io::Error::other(format!(
+            "not enough memory: holding this ISO in memory needs {need_mb} MiB free and this machine has {free_mb} MiB"
+        )));
+    }
+    fs::create_dir_all(RAM_DIR)?;
+    let (kind, dir, options) = (cstr("tmpfs"), cstr(RAM_DIR), cstr(&format!("size={size}")));
+    if unsafe { libc::mount(kind.as_ptr(), dir.as_ptr(), kind.as_ptr(), 0, options.as_ptr().cast()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    log(format!("copying the ISO into memory ({} MiB)", size >> 20));
+    let file = format!("{RAM_DIR}/iso");
+    let mut out = fs::File::create(&file)?;
+    let (mut at, mut reported) = (0, 0);
+    while at < size {
+        let n = (size - at).min(4 << 20);
+        out.write_all(&http.fetch("GET", at, n).1)?;
+        at += n;
+        if at * 4 / size > reported {
+            reported = at * 4 / size;
+            log(format!("copied {} percent", reported * 25));
+        }
+    }
+    loop_device(&file)
+}
+
+fn loop_control() -> io::Result<fs::File> {
+    modprobe("loop");
+    fs::File::open("/dev/loop-control").map_err(|e| io::Error::other(format!("this kernel has no loop driver ({e})")))
+}
+
+/// Puts a read-only loop device on `file` and returns its path.
+fn loop_device(file: &str) -> io::Result<String> {
+    let control = loop_control()?;
+    let number = unsafe { libc::ioctl(control.as_raw_fd(), 0x4C82 as _) }; // LOOP_CTL_GET_FREE
+    if number < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let device = format!("/dev/loop{number}");
+    let node = retry(50, || fs::File::open(&device).ok()).ok_or_else(|| io::Error::other(format!("{device} did not appear")))?;
+    let backing = fs::File::open(file)?; // read-only, which makes the device read-only
+    ioctl(&node, 0x4C00, backing.as_raw_fd())?; // LOOP_SET_FD
+    Ok(device)
 }
 
 /// Polls every 100 ms.
@@ -373,16 +505,12 @@ fn connect_nbd(server_end: &UnixStream, size: u64) -> io::Result<()> {
 /// Gives the kernel one end of a socket pair as /dev/nbd0's "server" and
 /// answers its requests on the other end.
 fn serve_nbd() -> io::Result<()> {
-    let (host, path) = server()?;
+    let (host, path, _) = server()?;
     let mut http = Http { host, path, connection: None };
     let size = http.fetch("HEAD", 0, 0).0;
     let (kernel_end, mut ours) = UnixStream::pair()?;
     connect_nbd(&kernel_end, size)?;
     drop(kernel_end); // the kernel holds its own reference now
-
-    if let Ok(net) = std::env::var("OXI_NET") {
-        thread::spawn(move || keep_network(&net));
-    }
 
     loop {
         // magic, flags, type, handle, offset, length
@@ -404,6 +532,86 @@ fn serve_nbd() -> io::Result<()> {
         }
         ours.write_all(&reply)?;
     }
+}
+
+// ---- FUSE ----------------------------------------------------------------
+
+/// A file system holding one file, `iso`, read from the server on demand.
+struct IsoFs {
+    http: std::sync::Mutex<Http>,
+    size: u64,
+}
+
+impl IsoFs {
+    fn attr(&self, ino: u64) -> fuser::FileAttr {
+        let (kind, size, perm) = if ino == 1 { (fuser::FileType::Directory, 0, 0o555) } else { (fuser::FileType::RegularFile, self.size, 0o444) };
+        let epoch = std::time::UNIX_EPOCH;
+        fuser::FileAttr {
+            ino: fuser::INodeNo(ino),
+            size,
+            blocks: size.div_ceil(512),
+            atime: epoch,
+            mtime: epoch,
+            ctime: epoch,
+            crtime: epoch,
+            kind,
+            perm,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+}
+
+const FOREVER: Duration = Duration::from_secs(86400);
+
+impl fuser::Filesystem for IsoFs {
+    fn lookup(&self, _req: &fuser::Request, parent: fuser::INodeNo, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
+        match u64::from(parent) == 1 && name == "iso" {
+            true => reply.entry(&FOREVER, &self.attr(2), fuser::Generation(0)),
+            false => reply.error(fuser::Errno::ENOENT),
+        }
+    }
+
+    fn getattr(&self, _req: &fuser::Request, ino: fuser::INodeNo, _fh: Option<fuser::FileHandle>, reply: fuser::ReplyAttr) {
+        match u64::from(ino) {
+            ino @ (1 | 2) => reply.attr(&FOREVER, &self.attr(ino)),
+            _ => reply.error(fuser::Errno::ENOENT),
+        }
+    }
+
+    fn read(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyData,
+    ) {
+        let len = (size as u64).min(self.size.saturating_sub(offset));
+        match (u64::from(ino), len) {
+            (2, 0) => reply.data(&[]),
+            (2, _) => reply.data(&self.http.lock().unwrap().fetch("GET", offset, len).1),
+            _ => reply.error(fuser::Errno::ENOENT),
+        }
+    }
+}
+
+/// Serves the ISO as the file /oxi-boot-iso/iso until unmounted.
+fn serve_fuse() -> io::Result<()> {
+    let (host, path, _) = server()?;
+    let mut http = Http { host, path, connection: None };
+    let size = http.fetch("HEAD", 0, 0).0;
+    let mut config = fuser::Config::default();
+    config.mount_options.extend([fuser::MountOption::RO, fuser::MountOption::FSName("oxi-boot".into())]);
+    fuser::mount(IsoFs { http: std::sync::Mutex::new(http), size }, FUSE_DIR, &config)?;
+    Err(io::Error::other("the FUSE file system was unmounted"))
 }
 
 struct Http {

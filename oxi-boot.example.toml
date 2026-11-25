@@ -23,3 +23,4 @@ allow = []
 # name = "Debian 13"   # shown in the menu instead of the file name
 # hidden = true        # left out of the menu
 # as_is = true         # boot unpatched
+# attach = "ram"       # nbd (default) | fuse | ram: where the client starts in the fallback order

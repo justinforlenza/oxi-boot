@@ -28,6 +28,21 @@ pub struct IsoOverride {
     pub hidden: bool,
     /// Boot the ISO unpatched.
     pub as_is: bool,
+    /// The first way the helper tries to attach the ISO; it falls back to
+    /// the later ones. Default: nbd.
+    pub attach: Option<Attach>,
+}
+
+/// Ways to attach an ISO on the client, in fallback order.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Attach {
+    /// A network block device.
+    Nbd,
+    /// A FUSE file under a loop device, for kernels without NBD.
+    Fuse,
+    /// The whole ISO copied into the client's memory.
+    Ram,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]

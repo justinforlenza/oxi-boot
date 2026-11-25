@@ -8,4 +8,5 @@ repository.workspace = true
 
 # Ships inside every patched initrd as one static program: nothing beyond libc.
 [dependencies]
+fuser = { version = "0.19.0", default-features = false }
 libc = "0.2"

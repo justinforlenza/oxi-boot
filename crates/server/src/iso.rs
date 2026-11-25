@@ -5,7 +5,7 @@
 //! and so needs each record's position in the image, which no published ISO
 //! crate exposes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -128,6 +128,9 @@ pub fn files(file: &File) -> io::Result<Vec<Record>> {
     Ok(found)
 }
 
+/// Where moved files now are: original lba to (offset, length) in the view.
+pub type Placed = HashMap<u32, (u64, u64)>;
+
 /// Part of a file's new content.
 pub enum Piece {
     /// Bytes that are already in the ISO.
@@ -168,7 +171,14 @@ impl View {
     /// overlay. Only files below 4 GiB are used, because iPXE on BIOS cannot
     /// read past that. Content that fits nowhere goes after the ISO's end.
     /// `may_host` names the files that may be laid over.
-    pub fn replace(file: &File, records: &[Record], mut moved: Vec<(u32, Vec<Piece>)>, may_host: impl Fn(&Record) -> bool) -> io::Result<View> {
+    ///
+    /// Also returns where each moved file now is, as lba to (offset, length).
+    pub fn replace(
+        file: &File,
+        records: &[Record],
+        mut moved: Vec<(u32, Vec<Piece>)>,
+        may_host: impl Fn(&Record) -> bool,
+    ) -> io::Result<(View, Placed)> {
         let iso_len = file.metadata()?.len();
         let size_of = |pieces: &[Piece]| pieces.iter().map(Piece::len).sum::<u64>();
         moved.sort_by_key(|(_, pieces)| std::cmp::Reverse(size_of(pieces)));
@@ -184,23 +194,24 @@ impl View {
         hosts.retain(|(start, ..)| seen.insert(*start)); // the same file in two trees
         let mut end = iso_len.next_multiple_of(SECTOR);
 
-        let mut overlays = Vec::new();
+        let (mut overlays, mut placed) = (Vec::new(), HashMap::new());
         for (lba, pieces) in moved {
             let (len, need) = (size_of(&pieces), size_of(&pieces).next_multiple_of(SECTOR));
             let start = match hosts.iter_mut().find(|(start, end, _)| end - start >= need) {
                 Some((start, _, path)) => {
-                    eprintln!("patch: {len} bytes laid over {path}");
+                    eprintln!("patch: {len} bytes laid over {path} at offset {start}");
                     *start += need;
                     *start - need
                 }
                 None => {
-                    eprintln!("patch: {len} bytes placed after the ISO's end{}", if end + need > BIOS_LIMIT { " (out of reach on BIOS)" } else { "" });
+                    eprintln!("patch: {len} bytes placed after the ISO's end, at offset {end}{}", if end + need > BIOS_LIMIT { " (out of reach on BIOS)" } else { "" });
                     end += need;
                     end - need
                 }
             };
             // Both fields are stored little-endian then big-endian.
             let (new_lba, new_len) = ((start / SECTOR) as u32, len as u32);
+            placed.insert(lba, (start, len));
             for r in records.iter().filter(|r| r.lba == lba) {
                 overlays.push((r.pos + 2, Piece::Bytes([new_lba.to_le_bytes(), new_lba.to_be_bytes()].concat())));
                 overlays.push((r.pos + 10, Piece::Bytes([new_len.to_le_bytes(), new_len.to_be_bytes()].concat())));
@@ -217,7 +228,7 @@ impl View {
         // Zero padding after content placed past the end: GRUB reads in 32 KiB
         // blocks, and a block that crosses the end of the disk is refused.
         let size = if end > iso_len { (end + (1 << 20)).next_multiple_of(1 << 20) } else { iso_len };
-        Ok(View { iso_len, overlays, size })
+        Ok((View { iso_len, overlays, size }, placed))
     }
 
     pub fn size(&self) -> u64 {
@@ -309,7 +320,7 @@ pub mod tests {
         assert_eq!(paths, [("BOOT/INITRD.IMG", 30, 10), ("ROOTFS.SFS", 40, 6144)]);
 
         let pieces = vec![Piece::Iso { offset: 30 * SECTOR, len: 10 }, Piece::Bytes(b"+new".to_vec())];
-        let view = View::replace(&file, &records, vec![(30, pieces)], |_| true).unwrap();
+        let view = View::replace(&file, &records, vec![(30, pieces)], |_| true).unwrap().0;
         assert_eq!(view.size(), 50 * SECTOR); // laid over ROOTFS.SFS, so no longer
         // The directory record now points at sector 40 with the new length...
         let moved = files_in_view(&view, &file);
@@ -326,7 +337,7 @@ pub mod tests {
         let file = image("tail");
         let records = files(&file).unwrap();
         let big = vec![Piece::Bytes(vec![9; 4 * SECTOR as usize])];
-        let view = View::replace(&file, &records, vec![(30, big)], |_| true).unwrap();
+        let view = View::replace(&file, &records, vec![(30, big)], |_| true).unwrap().0;
         assert_eq!(view.size(), 2 << 20);
         assert_eq!(view.read(&file, 50 * SECTOR - 1, 2).unwrap(), [0, 9]);
         assert_eq!(view.read(&file, 54 * SECTOR - 1, 2).unwrap(), [9, 0]);

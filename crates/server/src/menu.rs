@@ -88,9 +88,13 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
         }
         for (shown, path) in &folder.isos {
             writeln!(menus, "item i{isos} {shown}").unwrap();
-            // Patched unless the config says otherwise; the server decides per ISO what a patch is.
-            let kind = if config.iso.get(path).is_some_and(|o| o.as_is) { "iso" } else { "patched" };
-            writeln!(boots, ":i{isos}\nsanboot {base}/{kind}/{} || goto failed", url_path(path)).unwrap();
+            // Patched unless the config says otherwise. How a patched ISO boots is
+            // only known once its patch is worked out, so that is a script of its own.
+            let boot = match config.iso.get(path).is_some_and(|o| o.as_is) {
+                true => format!("sanboot {base}/as-is/{}", url_path(path)),
+                false => format!("chain {base}/boot/{}", url_path(path)),
+            };
+            writeln!(boots, ":i{isos}\n{boot} || goto failed").unwrap();
             if *path == config.menu.default {
                 default = format!("i{isos}");
             }
@@ -121,7 +125,7 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
     menus.push_str(":asis\nmenu Boot as-is (unpatched)\nitem f0 ..\n");
     for (n, path) in root.paths().into_iter().enumerate() {
         writeln!(menus, "item a{n} {path}").unwrap();
-        writeln!(boots, ":a{n}\nsanboot {base}/iso/{} || goto failed", url_path(path)).unwrap();
+        writeln!(boots, ":a{n}\nsanboot {base}/as-is/{} || goto failed", url_path(path)).unwrap();
     }
     menus.push_str("choose target && goto ${target} || goto f0\n");
     let menus = menus.replace("--default DEFAULT ", &format!("--default {default} "));
@@ -166,11 +170,11 @@ mod tests {
         assert!(script.contains("choose --timeout 5000 --default i2 target && goto ${target} || goto f0\n"));
         assert!(script.contains(":f1\nmenu linux\nitem f0 ..\nitem i2 Arch Linux\nchoose target"));
         assert!(script.contains("item --gap\nitem asis Boot an ISO as-is (unpatched)...\nitem local "));
-        assert!(script.contains(":i0\nsanboot http://10.0.0.1/iso/a.iso || goto failed\n")); // as_is in the config
-        assert!(script.contains(":i1\nsanboot http://10.0.0.1/patched/b%20tool.ISO || goto failed\n"));
-        assert!(script.contains(":i2\nsanboot http://10.0.0.1/patched/linux/arch.iso || goto failed\n"));
+        assert!(script.contains(":i0\nsanboot http://10.0.0.1/as-is/a.iso || goto failed\n")); // as_is in the config
+        assert!(script.contains(":i1\nchain http://10.0.0.1/boot/b%20tool.ISO || goto failed\n"));
+        assert!(script.contains(":i2\nchain http://10.0.0.1/boot/linux/arch.iso || goto failed\n"));
         assert!(script.contains(":asis\nmenu Boot as-is (unpatched)\nitem f0 ..\nitem a0 a.iso\nitem a1 b tool.ISO\nitem a2 linux/arch.iso\nchoose"));
-        assert!(script.contains(":a2\nsanboot http://10.0.0.1/iso/linux/arch.iso || goto failed\n"));
+        assert!(script.contains(":a2\nsanboot http://10.0.0.1/as-is/linux/arch.iso || goto failed\n"));
         for label in ["local", "reboot", "firmware", "shell", "failed"] {
             assert!(script.contains(&format!("\n:{label}\n")), "{label}");
         }

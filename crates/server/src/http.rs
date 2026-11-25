@@ -8,7 +8,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
 use tower_http::services::ServeDir;
 
@@ -28,7 +28,10 @@ pub fn router(config: Arc<Config>, base: String, patches: Arc<Patches>) -> Route
     Router::new()
         .route("/boot.ipxe", get(boot))
         .route("/menu.ipxe", get(menu))
+        .route("/boot/{*path}", get(boot_iso))
         .route("/patched/{*path}", get(patched))
+        .route("/as-is/{*path}", get(as_is))
+        .route("/direct/{*path}", get(direct))
         .route("/helper-log", get(helper_log))
         .nest_service("/iso", ServeDir::new(&config.server.iso_dir))
         .with_state(App { config, base, patches })
@@ -66,28 +69,78 @@ async fn helper_log(RawQuery(message): RawQuery) {
     eprintln!("helper: {}", message.unwrap_or_default());
 }
 
-/// One ISO as its patched view, whole or by byte range.
-async fn patched(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap) -> Response {
+/// The ISO at `path` under the ISO folder, with its patch worked out.
+async fn open(app: &App, path: &str) -> Result<Arc<Patched>, StatusCode> {
     // The path names a file under the ISO folder and nothing else.
     let inside = path.split('/').all(|part| !part.is_empty() && !part.starts_with('.'));
     if !inside || !path.to_ascii_lowercase().ends_with(".iso") {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(StatusCode::NOT_FOUND);
     }
-    let iso = match app.patches.get(&path, &menu::url_path(&path)).await {
-        Ok(iso) => iso,
-        Err(e) => {
-            eprintln!("http: {path}: {e}");
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
+    app.patches.get(path, &menu::url_path(path)).await.map_err(|e| {
+        eprintln!("http: {path}: {e}");
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// The script that boots one ISO patched. It is a request of its own, not
+/// part of the menu, because only the finished patch says how to boot.
+async fn boot_iso(State(app): State<App>, Path(path): Path<String>) -> Result<String, StatusCode> {
+    let iso = open(&app, &path).await?;
+    let (base, url) = (&app.base, menu::url_path(&path));
+    let cd = format!("sanboot {base}/patched/{url}\n");
+    Ok(match &iso.direct {
+        None => format!("#!ipxe\n{cd}"),
+        Some(direct) => format!(
+            "#!ipxe\niseq ${{platform}} {} || goto cd\n\
+             kernel {base}/direct/{url}/kernel initrd=initrd {}\n\
+             initrd {base}/direct/{url}/initrd\nboot\n:cd\n{cd}",
+            direct.platform, direct.options
+        ),
+    })
+}
+
+/// One ISO as its patched view, whole or by byte range.
+async fn patched(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap) -> Result<Response, StatusCode> {
+    let iso = open(&app, &path).await?;
     let size = iso.view.size();
+    Ok(ranged(iso, 0, size, &headers))
+}
+
+/// One ISO untouched, for booting as-is. `/iso/` serves the same bytes; this
+/// route also understands the broken byte ranges of iPXE on BIOS.
+async fn as_is(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap) -> Result<Response, StatusCode> {
+    let inside = path.split('/').all(|part| !part.is_empty() && !part.starts_with('.'));
+    let file = std::fs::File::open(app.config.server.iso_dir.join(&path)).ok().filter(|_| inside).ok_or(StatusCode::NOT_FOUND)?;
+    let view = crate::iso::View::unpatched(&file).map_err(|_| StatusCode::NOT_FOUND)?;
+    let size = view.size();
+    Ok(ranged(Arc::new(Patched { file, view, direct: None }), 0, size, &headers))
+}
+
+/// The kernel or initrd of an ISO that is started without its boot loader:
+/// `/direct/<iso path>/kernel` and `/direct/<iso path>/initrd`.
+async fn direct(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap) -> Result<Response, StatusCode> {
+    let (path, part) = path.rsplit_once('/').ok_or(StatusCode::NOT_FOUND)?;
+    let iso = open(&app, path).await?;
+    let direct = iso.direct.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let (offset, len) = match part {
+        "kernel" => direct.kernel,
+        "initrd" => direct.initrd,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    Ok(ranged(iso, offset, len, &headers))
+}
+
+/// `size` bytes of the view from `offset`, whole or the byte range asked for.
+fn ranged(iso: Arc<Patched>, offset: u64, size: u64, headers: &HeaderMap) -> Response {
     // One byte range, or everything. shortcut: a request for several ranges
     // gets the whole file, which HTTP allows.
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|value| http_range_header::parse_range_header(value.to_str().ok()?).ok()?.validate(size).ok())
-        .filter(|ranges| ranges.len() == 1)
-        .map(|ranges| (*ranges[0].start(), *ranges[0].end()));
+    let header = headers.get(header::RANGE).and_then(|value| value.to_str().ok());
+    let range = header.and_then(|value| {
+        overflowed_range(value).filter(|(start, end)| start <= end && *end < size).or_else(|| {
+            let ranges = http_range_header::parse_range_header(value).ok()?.validate(size).ok()?;
+            (ranges.len() == 1).then(|| (*ranges[0].start(), *ranges[0].end()))
+        })
+    });
     let (start, len) = range.map_or((0, size), |(start, end)| (start, end - start + 1));
     let mut response = Response::builder()
         .header(header::ACCEPT_RANGES, "bytes")
@@ -96,7 +149,24 @@ async fn patched(State(app): State<App>, Path(path): Path<String>, headers: Head
     if let Some((start, end)) = range {
         response = response.status(StatusCode::PARTIAL_CONTENT).header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
-    response.body(body(iso, start, len)).unwrap()
+    response.body(body(iso, offset + start, len)).unwrap()
+}
+
+/// iPXE on BIOS keeps a disk offset in a signed 32-bit number, so a read
+/// between 2 and 4 GiB arrives as a negative offset ("bytes=-888604672--888602625").
+/// The real offset is that number plus 4 GiB. Reads past 4 GiB wrap around to
+/// valid-looking low offsets and cannot be told apart; the patch keeps what a
+/// boot loader needs below 4 GiB for that reason.
+fn overflowed_range(header: &str) -> Option<(u64, u64)> {
+    let spec = header.strip_prefix("bytes=")?;
+    // The separator is the first '-' that is not the start's own sign.
+    let split = 1 + spec.get(1..)?.find('-')?;
+    let (start, end): (i64, i64) = (spec[..split].parse().ok()?, spec[split + 1..].parse().ok()?);
+    if start >= 0 && end >= 0 {
+        return None; // an ordinary range
+    }
+    let fix = |offset: i64| if offset < 0 { offset + (1 << 32) } else { offset } as u64;
+    Some((fix(start), fix(end)))
 }
 
 /// `len` bytes of the view from `start`, read a piece at a time off the async threads.
@@ -110,4 +180,20 @@ fn body(iso: Arc<Patched>, start: u64, len: u64) -> Body {
         let chunk = tokio::task::spawn_blocking(move || reader.view.read(&reader.file, at, n as usize)).await;
         Some((chunk.map_err(std::io::Error::other).and_then(|read| read), (iso, at + n, left - n)))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_ranges_that_overflowed_on_the_client() {
+        // 3406362624 and 3406364671 as signed 32-bit numbers
+        assert_eq!(overflowed_range("bytes=-888604672--888602625"), Some((3406362624, 3406364671)));
+        // A read that starts just under 2 GiB and ends over it
+        assert_eq!(overflowed_range("bytes=2147481600--2147481601"), Some((2147481600, 2147485695)));
+        assert_eq!(overflowed_range("bytes=0-2047"), None);
+        assert_eq!(overflowed_range("bytes=-500"), None); // a real "last 500 bytes" request
+        assert_eq!(overflowed_range("bytes=100-"), None);
+    }
 }

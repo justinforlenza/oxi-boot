@@ -50,7 +50,7 @@ async fn run(path: &str) -> Result<(), Error> {
     if helper.is_none() {
         eprintln!("oxi-boot: no helper at {}: ISOs will boot unpatched", helper_path.display());
     }
-    let patches = Arc::new(patch::Patches::new(config.server.iso_dir.clone(), helper, format!("{}:80", iface.ip)));
+    let patches = Arc::new(patch::Patches::new(config.clone(), helper, format!("{}:80", iface.ip)));
     let app = http::router(config.clone(), format!("http://{}", iface.ip), patches);
     eprintln!("oxi-boot: serving {} on {name} ({}), DHCP mode {:?}", config.server.iso_dir.display(), iface.ip, config.dhcp.mode);
 
