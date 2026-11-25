@@ -11,12 +11,24 @@ use crate::config::{Config, IsoOverride};
 /// Everything but letters, digits and these is escaped in an ISO's URL.
 const URL_PATH: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~').remove(b'/');
 
+pub fn url_path(path: &str) -> String {
+    utf8_percent_encode(path, URL_PATH).to_string()
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Folder {
     name: String,
     folders: Vec<Folder>,
     /// (name shown, path under the ISO folder)
     isos: Vec<(String, String)>,
+}
+
+impl Folder {
+    /// Every ISO's path, folders included.
+    pub fn paths(&self) -> Vec<&str> {
+        let below = self.folders.iter().flat_map(Folder::paths);
+        self.isos.iter().map(|(_, path)| path.as_str()).chain(below).collect()
+    }
 }
 
 /// The ISOs under `dir`, sorted by name. Hidden ISOs, dot files and folders
@@ -76,7 +88,9 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
         }
         for (shown, path) in &folder.isos {
             writeln!(menus, "item i{isos} {shown}").unwrap();
-            writeln!(boots, ":i{isos}\nsanboot {base}/iso/{} || goto failed", utf8_percent_encode(path, URL_PATH)).unwrap();
+            // Patched unless the config says otherwise; the server decides per ISO what a patch is.
+            let kind = if config.iso.get(path).is_some_and(|o| o.as_is) { "iso" } else { "patched" };
+            writeln!(boots, ":i{isos}\nsanboot {base}/{kind}/{} || goto failed", url_path(path)).unwrap();
             if *path == config.menu.default {
                 default = format!("i{isos}");
             }
@@ -86,10 +100,11 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
             // Esc in a folder goes back to the top menu.
             Some(_) => menus.push_str("choose target && goto ${target} || goto f0\n"),
             None => {
-                menus.push_str(
-                    "item --gap\nitem local Boot from local disk\nitem reboot Reboot\n\
-                     item firmware Firmware setup\nitem shell iPXE shell\n",
-                );
+                menus.push_str("item --gap\n");
+                if !root.paths().is_empty() {
+                    menus.push_str("item asis Boot an ISO as-is (unpatched)...\n");
+                }
+                menus.push_str("item local Boot from local disk\nitem reboot Reboot\nitem firmware Firmware setup\nitem shell iPXE shell\n");
                 let timeout = match config.menu.timeout {
                     0 => String::new(),
                     seconds => format!("--timeout {} ", seconds * 1000),
@@ -102,6 +117,13 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
     if default == "local" && config.menu.default != "local" {
         eprintln!("menu: default {:?} is not an ISO in the folder; using the local disk", config.menu.default);
     }
+    // The as-is menu: every ISO by its path, booted untouched.
+    menus.push_str(":asis\nmenu Boot as-is (unpatched)\nitem f0 ..\n");
+    for (n, path) in root.paths().into_iter().enumerate() {
+        writeln!(menus, "item a{n} {path}").unwrap();
+        writeln!(boots, ":a{n}\nsanboot {base}/iso/{} || goto failed", url_path(path)).unwrap();
+    }
+    menus.push_str("choose target && goto ${target} || goto f0\n");
     let menus = menus.replace("--default DEFAULT ", &format!("--default {default} "));
     format!(
         "#!ipxe\ngoto f0\n{menus}{boots}\
@@ -130,7 +152,7 @@ mod tests {
         }
         let config = config(
             "[menu]\ntimeout = 5\ndefault = \"linux/arch.iso\"\n\
-             [iso.\"secret.iso\"]\nhidden = true\n[iso.\"linux/arch.iso\"]\nname = \"Arch Linux\"\n",
+             [iso.\"secret.iso\"]\nhidden = true\n[iso.\"linux/arch.iso\"]\nname = \"Arch Linux\"\n[iso.\"a.iso\"]\nas_is = true\n",
         );
         let root = scan(&dir, "", &config.iso);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -143,8 +165,12 @@ mod tests {
         assert!(script.starts_with("#!ipxe\ngoto f0\n:f0\nmenu oxi-boot\nitem f1 linux/\nitem i0 a\nitem i1 b tool\nitem --gap\n"));
         assert!(script.contains("choose --timeout 5000 --default i2 target && goto ${target} || goto f0\n"));
         assert!(script.contains(":f1\nmenu linux\nitem f0 ..\nitem i2 Arch Linux\nchoose target"));
-        assert!(script.contains(":i1\nsanboot http://10.0.0.1/iso/b%20tool.ISO || goto failed\n"));
-        assert!(script.contains(":i2\nsanboot http://10.0.0.1/iso/linux/arch.iso || goto failed\n"));
+        assert!(script.contains("item --gap\nitem asis Boot an ISO as-is (unpatched)...\nitem local "));
+        assert!(script.contains(":i0\nsanboot http://10.0.0.1/iso/a.iso || goto failed\n")); // as_is in the config
+        assert!(script.contains(":i1\nsanboot http://10.0.0.1/patched/b%20tool.ISO || goto failed\n"));
+        assert!(script.contains(":i2\nsanboot http://10.0.0.1/patched/linux/arch.iso || goto failed\n"));
+        assert!(script.contains(":asis\nmenu Boot as-is (unpatched)\nitem f0 ..\nitem a0 a.iso\nitem a1 b tool.ISO\nitem a2 linux/arch.iso\nchoose"));
+        assert!(script.contains(":a2\nsanboot http://10.0.0.1/iso/linux/arch.iso || goto failed\n"));
         for label in ["local", "reboot", "firmware", "shell", "failed"] {
             assert!(script.contains(&format!("\n:{label}\n")), "{label}");
         }

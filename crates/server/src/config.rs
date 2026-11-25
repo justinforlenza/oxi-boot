@@ -26,8 +26,7 @@ pub struct IsoOverride {
     pub name: Option<String>,
     /// Left out of the menu.
     pub hidden: bool,
-    /// Boot the ISO unpatched. Has no effect until the Linux path (phase 3)
-    /// exists: every ISO boots unpatched today.
+    /// Boot the ISO unpatched.
     pub as_is: bool,
 }
 
@@ -36,7 +35,8 @@ pub struct IsoOverride {
 pub struct Server {
     pub interface: String,
     pub iso_dir: PathBuf,
-    /// Folder holding the iPXE files: undionly.kpxe and snponly.efi.
+    /// Folder holding the iPXE files (undionly.kpxe, snponly.efi) and the
+    /// helper program (oxi-boot-helper).
     #[serde(default = "default_ipxe_dir")]
     pub ipxe_dir: PathBuf,
 }

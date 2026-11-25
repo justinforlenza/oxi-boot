@@ -1,7 +1,7 @@
 [server]
 interface = "eth0"
 iso_dir = "/srv/iso"
-# ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe and snponly.efi
+# ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe, snponly.efi and oxi-boot-helper
 
 [dhcp]
 mode = "proxy"   # proxy | full | external
@@ -22,4 +22,4 @@ allow = []
 # [iso."linux/debian-13.iso"]
 # name = "Debian 13"   # shown in the menu instead of the file name
 # hidden = true        # left out of the menu
-# as_is = true         # boot unpatched (no effect until the Linux path exists)
+# as_is = true         # boot unpatched

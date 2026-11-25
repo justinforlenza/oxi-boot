@@ -8,3 +8,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/justinforlenza/oxi-boot"
+
+# The helper is added to every initrd, so size matters more than speed.
+[profile.release.package.oxi-boot-helper]
+opt-level = "s"
+
+[profile.release]
+strip = true

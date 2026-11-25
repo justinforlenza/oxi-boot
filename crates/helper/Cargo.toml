@@ -6,5 +6,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Ships inside every patched initrd: keep this dependency-free.
+# Ships inside every patched initrd as one static program: nothing beyond libc.
 [dependencies]
+libc = "0.2"
