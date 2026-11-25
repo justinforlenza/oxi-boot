@@ -1,16 +1,25 @@
 [server]
 interface = "eth0"
 iso_dir = "/srv/iso"
+# ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe and snponly.efi
 
 [dhcp]
 mode = "proxy"   # proxy | full | external
 range = "192.168.1.100-192.168.1.200"  # full mode only
+# router = "192.168.1.1"   # full mode only
+# dns = ["192.168.1.1"]    # full mode only
 
 [menu]
 timeout = 10       # seconds, 0 = wait forever
-default = "local"
+default = "local"  # or an ISO's path under iso_dir
 
 [access]
 policy = "allow"   # what unknown machines get
 deny = ["aa:bb:cc:dd:ee:ff"]
 allow = []
+
+# Per-ISO settings, keyed by the ISO's path under iso_dir.
+# [iso."linux/debian-13.iso"]
+# name = "Debian 13"   # shown in the menu instead of the file name
+# hidden = true        # left out of the menu
+# as_is = true         # boot unpatched (no effect until the Linux path exists)

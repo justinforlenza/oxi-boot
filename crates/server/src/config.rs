@@ -1,6 +1,5 @@
-// Fields are only printed until the server modules that read them exist.
-#![allow(dead_code)]
-
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -15,6 +14,21 @@ pub struct Config {
     pub menu: Menu,
     #[serde(default)]
     pub access: Access,
+    /// Per-ISO settings, keyed by the ISO's path under `iso_dir`.
+    #[serde(default)]
+    pub iso: HashMap<String, IsoOverride>,
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IsoOverride {
+    /// Shown in the menu instead of the file name.
+    pub name: Option<String>,
+    /// Left out of the menu.
+    pub hidden: bool,
+    /// Boot the ISO unpatched. Has no effect until the Linux path (phase 3)
+    /// exists: every ISO boots unpatched today.
+    pub as_is: bool,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -22,6 +36,13 @@ pub struct Config {
 pub struct Server {
     pub interface: String,
     pub iso_dir: PathBuf,
+    /// Folder holding the iPXE files: undionly.kpxe and snponly.efi.
+    #[serde(default = "default_ipxe_dir")]
+    pub ipxe_dir: PathBuf,
+}
+
+fn default_ipxe_dir() -> PathBuf {
+    "/usr/share/oxi-boot".into()
 }
 
 #[derive(Debug, Default, PartialEq, Deserialize)]
@@ -30,6 +51,9 @@ pub struct Dhcp {
     pub mode: DhcpMode,
     /// Address pool, full mode only.
     pub range: Option<String>,
+    /// Gateway and name servers handed to clients, full mode only.
+    pub router: Option<Ipv4Addr>,
+    pub dns: Vec<Ipv4Addr>,
 }
 
 #[derive(Debug, Default, PartialEq, Deserialize)]
@@ -75,6 +99,15 @@ pub enum Policy {
     Deny,
 }
 
+impl Access {
+    /// Whether the machine with this MAC address may network boot. The deny
+    /// list wins over the allow list; the policy covers everyone else.
+    pub fn allows(&self, mac: &str) -> bool {
+        let same = |listed: &String| listed.replace('-', ":").eq_ignore_ascii_case(&mac.replace('-', ":"));
+        !self.deny.iter().any(same) && (self.allow.iter().any(same) || self.policy == Policy::Allow)
+    }
+}
+
 pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
 }
@@ -92,10 +125,13 @@ mod tests {
                 server: Server {
                     interface: "eth0".into(),
                     iso_dir: "/srv/iso".into(),
+                    ipxe_dir: "/usr/share/oxi-boot".into(),
                 },
                 dhcp: Dhcp {
                     mode: DhcpMode::Proxy,
                     range: Some("192.168.1.100-192.168.1.200".into()),
+                    router: None,
+                    dns: vec![],
                 },
                 menu: Menu::default(),
                 access: Access {
@@ -103,6 +139,7 @@ mod tests {
                     allow: vec![],
                     deny: vec!["aa:bb:cc:dd:ee:ff".into()],
                 },
+                iso: HashMap::new(),
             }
         );
     }
@@ -112,6 +149,22 @@ mod tests {
         let config: Config = toml::from_str("[server]\ninterface = \"eth0\"\niso_dir = \"/srv/iso\"").unwrap();
         assert_eq!(config.dhcp.mode, DhcpMode::Proxy);
         assert_eq!(config.menu.timeout, 10);
+    }
+
+    #[test]
+    fn access_lists() {
+        let access = |policy, allow: &[&str], deny: &[&str]| Access {
+            policy,
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        };
+        let mac = "52:54:00:12:34:56";
+        assert!(access(Policy::Allow, &[], &[]).allows(mac));
+        assert!(!access(Policy::Allow, &[], &["52-54-00-12-34-56"]).allows(mac));
+        assert!(!access(Policy::Deny, &[], &[]).allows(mac));
+        assert!(access(Policy::Deny, &["52:54:00:12:34:56"], &[]).allows("52:54:00:12:34:56"));
+        assert!(access(Policy::Deny, &["52:54:00:12:34:56"], &[]).allows("52:54:00:12:34:56".to_uppercase().as_str()));
+        assert!(!access(Policy::Deny, &[mac], &[mac]).allows(mac)); // deny wins
     }
 
     #[test]
