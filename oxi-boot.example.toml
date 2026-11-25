@@ -1,7 +1,7 @@
 [server]
 interface = "eth0"
 iso_dir = "/srv/iso"
-# ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe, snponly.efi and oxi-boot-helper
+# ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe, snponly.efi, oxi-boot-helper and wimboot
 
 [dhcp]
 mode = "proxy"   # proxy | full | external

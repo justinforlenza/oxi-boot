@@ -1,5 +1,6 @@
 //! HTTP: the boot script and menu for iPXE, and the ISOs by byte range, both
-//! untouched (`/iso/`) and patched (`/patched/`).
+//! untouched (`/iso/`) and patched (`/patched/`), and what a Windows disc
+//! needs to start (`/wimboot`, `/win/`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,11 +11,12 @@ use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::menu;
 use crate::patch::{Patched, Patches};
+use crate::windows;
 
 #[derive(Clone)]
 struct App {
@@ -22,9 +24,10 @@ struct App {
     /// The server's own URL, without a trailing slash.
     base: String,
     patches: Arc<Patches>,
+    windows: Arc<windows::Isos>,
 }
 
-pub fn router(config: Arc<Config>, base: String, patches: Arc<Patches>) -> Router {
+pub fn router(config: Arc<Config>, base: String, patches: Arc<Patches>, windows: Arc<windows::Isos>) -> Router {
     Router::new()
         .route("/boot.ipxe", get(boot))
         .route("/menu.ipxe", get(menu))
@@ -33,8 +36,10 @@ pub fn router(config: Arc<Config>, base: String, patches: Arc<Patches>) -> Route
         .route("/as-is/{*path}", get(as_is))
         .route("/direct/{*path}", get(direct))
         .route("/helper-log", get(helper_log))
+        .route("/win/{*path}", get(win))
+        .route_service("/wimboot", ServeFile::new(config.server.ipxe_dir.join("wimboot")))
         .nest_service("/iso", ServeDir::new(&config.server.iso_dir))
-        .with_state(App { config, base, patches })
+        .with_state(App { config, base, patches, windows })
 }
 
 /// The first script every client runs: it asks for the menu and says who it
@@ -85,8 +90,12 @@ async fn open(app: &App, path: &str) -> Result<Arc<Patched>, StatusCode> {
 /// The script that boots one ISO patched. It is a request of its own, not
 /// part of the menu, because only the finished patch says how to boot.
 async fn boot_iso(State(app): State<App>, Path(path): Path<String>) -> Result<String, StatusCode> {
-    let iso = open(&app, &path).await?;
     let (base, url) = (&app.base, menu::url_path(&path));
+    if let Some(installer) = app.windows.tree(&path).and_then(|tree| windows::installer(&tree)) {
+        eprintln!("http: {path} boots as Windows {}", if installer { "Setup, from the file share" } else { "PE, with nothing added" });
+        return Ok(windows::script(base, &url, installer));
+    }
+    let iso = open(&app, &path).await?;
     let cd = format!("sanboot {base}/patched/{url}\n");
     Ok(match &iso.direct {
         None => format!("#!ipxe\n{cd}"),
@@ -97,6 +106,31 @@ async fn boot_iso(State(app): State<App>, Path(path): Path<String>) -> Result<St
             direct.platform, direct.options
         ),
     })
+}
+
+/// One file out of a Windows ISO, or one of the two startup files we add:
+/// `/win/<iso path>?file=<path inside the ISO>`.
+async fn win(State(app): State<App>, Path(path): Path<String>, Query(query): Query<HashMap<String, String>>) -> Result<Response, StatusCode> {
+    let tree = app.windows.tree(&path).ok_or(StatusCode::NOT_FOUND)?;
+    let reply = |len: u64, body: Body| Ok(Response::builder().header(header::CONTENT_LENGTH, len).body(body).unwrap());
+    match query.get("file").map_or("", String::as_str) {
+        "winpeshl.ini" => reply(windows::WINPESHL.len() as u64, windows::WINPESHL.into()),
+        "install.bat" => {
+            let script = app.windows.install_bat(&path);
+            reply(script.len() as u64, script.into())
+        }
+        file => {
+            let node = tree.find(file).filter(|&node| !tree.node(node).dir).ok_or(StatusCode::NOT_FOUND)?;
+            let size = tree.node(node).size;
+            reply(size, Body::from_stream(futures_util::stream::unfold(0, move |at| {
+                let tree = tree.clone();
+                async move {
+                    let chunk = tokio::task::spawn_blocking(move || tree.read(node, at, 1 << 20)).await;
+                    (at < size).then(|| (chunk.map_err(std::io::Error::other).and_then(|read| read), at + (1 << 20)))
+                }
+            })))
+        }
+    }
 }
 
 /// One ISO as its patched view, whole or by byte range.

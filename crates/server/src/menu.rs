@@ -73,7 +73,7 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
     // Folders become labels f0, f1, ... (f0 is the top menu) and ISOs i0, i1, ...
     let (mut menus, mut boots, mut default) = (String::new(), String::new(), "local".to_string());
     let mut todo = vec![(root, "f0".to_string(), None::<String>)];
-    let (mut folders, mut isos) = (1, 0);
+    let (mut folders, mut isos, mut default_item) = (1, 0, String::new());
     while let Some((folder, label, parent)) = todo.pop() {
         let title = if parent.is_some() { folder.name.as_str() } else { "oxi-boot" };
         write!(menus, ":{label}\nmenu {title}\n").unwrap();
@@ -97,6 +97,9 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
             writeln!(boots, ":i{isos}\n{boot} || goto failed").unwrap();
             if *path == config.menu.default {
                 default = format!("i{isos}");
+                if parent.is_some() {
+                    default_item = format!("item i{isos} {shown}\n");
+                }
             }
             isos += 1;
         }
@@ -104,6 +107,9 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
             // Esc in a folder goes back to the top menu.
             Some(_) => menus.push_str("choose target && goto ${target} || goto f0\n"),
             None => {
+                // The timeout can only pick an entry of this menu, so a default
+                // from a folder is also listed here; filled in below.
+                menus.push_str("DEFAULT_ITEM");
                 menus.push_str("item --gap\n");
                 if !root.paths().is_empty() {
                     menus.push_str("item asis Boot an ISO as-is (unpatched)...\n");
@@ -128,7 +134,7 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
         writeln!(boots, ":a{n}\nsanboot {base}/as-is/{} || goto failed", url_path(path)).unwrap();
     }
     menus.push_str("choose target && goto ${target} || goto f0\n");
-    let menus = menus.replace("--default DEFAULT ", &format!("--default {default} "));
+    let menus = menus.replace("--default DEFAULT ", &format!("--default {default} ")).replace("DEFAULT_ITEM", &default_item);
     format!(
         "#!ipxe\ngoto f0\n{menus}{boots}\
          :failed\nprompt Boot failed. Press a key to return to the menu.\ngoto f0\n\
@@ -166,7 +172,7 @@ mod tests {
         assert_eq!(root.folders[0].isos, [("Arch Linux".into(), "linux/arch.iso".into())]);
 
         let script = script(&root, &config, "http://10.0.0.1");
-        assert!(script.starts_with("#!ipxe\ngoto f0\n:f0\nmenu oxi-boot\nitem f1 linux/\nitem i0 a\nitem i1 b tool\nitem --gap\n"));
+        assert!(script.starts_with("#!ipxe\ngoto f0\n:f0\nmenu oxi-boot\nitem f1 linux/\nitem i0 a\nitem i1 b tool\nitem i2 Arch Linux\nitem --gap\n")); // the default, from its folder
         assert!(script.contains("choose --timeout 5000 --default i2 target && goto ${target} || goto f0\n"));
         assert!(script.contains(":f1\nmenu linux\nitem f0 ..\nitem i2 Arch Linux\nchoose target"));
         assert!(script.contains("item --gap\nitem asis Boot an ISO as-is (unpatched)...\nitem local "));
