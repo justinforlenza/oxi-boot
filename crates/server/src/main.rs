@@ -22,8 +22,11 @@ async fn main() -> ExitCode {
     // The file share library reports through `tracing`; $OXI_DEBUG shows every request.
     let level = if std::env::var_os("OXI_DEBUG").is_some() { tracing_subscriber::filter::LevelFilter::DEBUG } else { tracing_subscriber::filter::LevelFilter::WARN };
     tracing_subscriber::fmt().with_max_level(level).with_writer(std::io::stderr).init();
-    let path = std::env::args().nth(1).unwrap_or_else(|| "oxi-boot.toml".into());
-    match run(&path).await {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{}", config::USAGE);
+        return ExitCode::SUCCESS;
+    }
+    match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("oxi-boot: {e}");
@@ -33,10 +36,10 @@ async fn main() -> ExitCode {
 }
 
 /// Runs the services until one of them fails.
-async fn run(path: &str) -> Result<(), Error> {
-    let config = Arc::new(config::load(path).map_err(|e| format!("{path}: {e}"))?);
-    let name = &config.server.interface;
-    let iface = dhcp::iface(name)?;
+async fn run() -> Result<(), Error> {
+    let config = Arc::new(config::load(std::env::args().skip(1))?);
+    let (name, iface) = dhcp::iface(config.server.interface.as_deref())?;
+    let name = &name;
     let full = match config.dhcp.mode {
         DhcpMode::Full => Some(dhcp::Full::new(iface, &config.dhcp)?),
         _ => None,
@@ -82,7 +85,10 @@ async fn run(path: &str) -> Result<(), Error> {
         }
         std::future::pending().await
     };
+    // As a container's first process nothing stops us on SIGTERM unless we ask for it.
+    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
+        _ = stop.recv() => {}
         r = dhcp => r?,
         r = share => r,
         r = tftp.serve() => r.map_err(|e| format!("TFTP: {e}"))?,

@@ -150,7 +150,7 @@ mod tests {
     use super::*;
 
     fn config(extra: &str) -> Config {
-        toml::from_str(&format!("[server]\ninterface = \"eth0\"\niso_dir = \"/x\"\n{extra}")).unwrap()
+        crate::config::parse(&format!("[server]\ninterface = \"eth0\"\niso_dir = \"/x\"\n{extra}")).unwrap()
     }
 
     #[test]

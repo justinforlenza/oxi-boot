@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+use figment2::Figment;
+use figment2::providers::{Env, Format, Toml};
 use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
     pub server: Server,
     #[serde(default)]
     pub dhcp: Dhcp,
@@ -46,18 +49,22 @@ pub enum Attach {
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct Server {
-    pub interface: String,
+    /// The network card to serve on. Unset: the one the default route uses.
+    pub interface: Option<String>,
     pub iso_dir: PathBuf,
     /// Folder holding the iPXE files (undionly.kpxe, snponly.efi) and the
     /// helper program (oxi-boot-helper).
-    #[serde(default = "default_ipxe_dir")]
     pub ipxe_dir: PathBuf,
 }
 
-fn default_ipxe_dir() -> PathBuf {
-    "/usr/share/oxi-boot".into()
+impl Default for Server {
+    fn default() -> Self {
+        // A release download keeps its boot files in `boot`, next to the program.
+        let beside = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("boot"))).filter(|dir| dir.is_dir());
+        Server { interface: None, iso_dir: "/iso".into(), ipxe_dir: beside.unwrap_or_else(|| "/usr/share/oxi-boot".into()) }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Deserialize)]
@@ -123,22 +130,66 @@ impl Access {
     }
 }
 
-pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+pub const USAGE: &str = "usage: oxi-boot [config file] [--section.setting value]...
+
+Every setting can come from the config file (default: oxi-boot.toml), from an
+environment variable, or from an argument; each overrides the one before.
+  file         [dhcp]  mode = \"full\"
+  environment  OXI_BOOT_DHCP__MODE=full
+  argument     --dhcp.mode full
+A list is written [a,b] outside the file.";
+
+/// The settings from the command line `args`: the config file named there
+/// (if it exists), then `OXI_BOOT_` environment variables, then `--key value`
+/// arguments. With none of them, every default applies.
+pub fn load(args: impl IntoIterator<Item = String>) -> Result<Config, Box<dyn std::error::Error>> {
+    let (mut path, mut set) = (None, Vec::new());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.strip_prefix("--") {
+            None if path.is_none() => path = Some(arg),
+            None => return Err(format!("unexpected argument {arg:?}\n{USAGE}").into()),
+            Some(key) => {
+                let (key, value) = match key.split_once('=') {
+                    Some((key, value)) => (key.to_string(), value.to_string()),
+                    None => (key.to_string(), args.next().ok_or(format!("--{key} needs a value"))?),
+                };
+                set.push((key, value));
+            }
+        }
+    }
+    let path = path.unwrap_or_else(|| "oxi-boot.toml".into());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("oxi-boot: no config file at {path}");
+    }
+    // `__` separates section and setting, because setting names have `_` in them.
+    let mut figment = Figment::new().merge(Toml::file(&path).search(false)).merge(Env::prefixed("OXI_BOOT_").split("__"));
+    for (key, value) in set {
+        // Read like an environment variable's value: 10 is a number, [a,b] a list.
+        figment = figment.merge((key, value.parse::<figment2::value::Value>()?));
+    }
+    Ok(figment.extract()?)
+}
+
+/// A config from TOML text, for tests.
+#[cfg(test)]
+pub fn parse(text: &str) -> Result<Config, Box<figment2::Error>> {
+    Figment::new().merge(Toml::string(text)).extract().map_err(Box::new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+
     #[test]
     fn example_file_parses() {
-        let config: Config = toml::from_str(include_str!("../../../oxi-boot.example.toml")).unwrap();
+        let config = parse(include_str!("../../../oxi-boot.example.toml")).unwrap();
         assert_eq!(
             config,
             Config {
                 server: Server {
-                    interface: "eth0".into(),
+                    interface: Some("eth0".into()),
                     iso_dir: "/srv/iso".into(),
                     ipxe_dir: "/usr/share/oxi-boot".into(),
                 },
@@ -160,8 +211,31 @@ mod tests {
     }
 
     #[test]
+    fn arguments_override_the_file() {
+        let file = std::env::temp_dir().join(format!("oxi-boot-test-{}.toml", std::process::id()));
+        std::fs::write(&file, "[dhcp]\nmode = \"full\"\n[menu]\ntimeout = 5\n[iso.\"Linux/Debian-13.iso\"]\nhidden = true\n").unwrap();
+        let args = [file.to_str().unwrap(), "--menu.timeout", "0", "--dhcp.dns=[1.1.1.1,9.9.9.9]", "--server.iso_dir", "/srv/iso"];
+        let config = load(args.map(String::from)).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(config.dhcp.mode, DhcpMode::Full); // from the file
+        assert_eq!(config.menu.timeout, 0); // the argument wins
+        assert_eq!(config.dhcp.dns, ["1.1.1.1".parse::<Ipv4Addr>().unwrap(), "9.9.9.9".parse().unwrap()]);
+        assert_eq!(config.server.iso_dir, PathBuf::from("/srv/iso"));
+        assert!(config.iso["Linux/Debian-13.iso"].hidden); // names keep their capitals
+        assert!(load(["--dhcp.mod".to_string(), "full".to_string()]).is_err()); // a misspelt setting
+        assert!(load(["--dhcp.mode".to_string()]).is_err());
+    }
+
+    #[test]
+    fn nothing_is_required() {
+        let config = parse("").unwrap();
+        assert_eq!(config.server, Server { interface: None, iso_dir: "/iso".into(), ipxe_dir: "/usr/share/oxi-boot".into() });
+        assert_eq!(config.dhcp.mode, DhcpMode::Proxy);
+    }
+
+    #[test]
     fn only_server_section_is_required() {
-        let config: Config = toml::from_str("[server]\ninterface = \"eth0\"\niso_dir = \"/srv/iso\"").unwrap();
+        let config = parse("[server]\ninterface = \"eth0\"\niso_dir = \"/srv/iso\"").unwrap();
         assert_eq!(config.dhcp.mode, DhcpMode::Proxy);
         assert_eq!(config.menu.timeout, 10);
     }
@@ -184,6 +258,6 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_rejected() {
-        assert!(toml::from_str::<Config>("[server]\ninterface = \"eth0\"\niso_dir = \"/x\"\ntypo = 1").is_err());
+        assert!(parse("[server]\ninterface = \"eth0\"\niso_dir = \"/x\"\ntypo = 1").is_err());
     }
 }

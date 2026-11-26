@@ -1,6 +1,10 @@
+# Every setting is optional; with no config file at all the defaults below apply.
+# Each can also be set by an environment variable (OXI_BOOT_DHCP__MODE=full) or
+# an argument (--dhcp.mode full), which override this file.
+
 [server]
-interface = "eth0"
-iso_dir = "/srv/iso"
+interface = "eth0"     # default: the network card your default route uses
+iso_dir = "/srv/iso"   # default: /iso
 # ipxe_dir = "/usr/share/oxi-boot"   # holds undionly.kpxe, snponly.efi, oxi-boot-helper and wimboot (ARM64: snponly-arm64.efi, oxi-boot-helper-arm64)
 
 [dhcp]

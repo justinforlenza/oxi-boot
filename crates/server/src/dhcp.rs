@@ -26,14 +26,30 @@ pub struct Iface {
     pub mask: Ipv4Addr,
 }
 
-pub fn iface(name: &str) -> io::Result<Iface> {
-    if_addrs::get_if_addrs()?
+/// The interface called `name` or, with no name, the one the default route
+/// leaves by; on a network with no route out, the only one there is.
+pub fn iface(name: Option<&str>) -> io::Result<(String, Iface)> {
+    // Connecting a UDP socket sends nothing; it only makes the kernel pick the source address.
+    let routed = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").and(s.local_addr())).ok().map(|a| a.ip());
+    let v4: Vec<_> = if_addrs::get_if_addrs()?
         .into_iter()
-        .find_map(|i| match i.addr {
-            if_addrs::IfAddr::V4(v4) if i.name == name => Some(Iface { ip: v4.ip, mask: v4.netmask }),
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some((i.name, Iface { ip: v4.ip, mask: v4.netmask })),
             _ => None,
         })
-        .ok_or_else(|| io::Error::other(format!("interface {name} has no IPv4 address")))
+        .collect();
+    let count = v4.len();
+    let found = match name {
+        Some(name) => v4.into_iter().find(|(n, _)| n == name),
+        None if count == 1 => v4.into_iter().next(),
+        None => v4.into_iter().find(|(_, i)| Some(std::net::IpAddr::V4(i.ip)) == routed),
+    };
+    found.ok_or_else(|| {
+        io::Error::other(match name {
+            Some(name) => format!("interface {name} has no IPv4 address"),
+            None => "cannot tell which network card to serve on; set server.interface".into(),
+        })
+    })
 }
 
 /// A UDP socket on `port` that hears broadcasts on `iface` only and may send
