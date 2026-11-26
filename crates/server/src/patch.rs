@@ -124,9 +124,16 @@ fn loader_entry(file: &File, records: &[Record]) -> Option<(String, String, Stri
     })
 }
 
-/// How to boot `file`. `helper` is the helper program and `conf` what it
-/// needs to find the server and the untouched ISO.
-pub fn plan(file: &File, helper: &[u8], conf: &str) -> io::Result<Plan> {
+/// The helper program for each kind of client; None where it is not installed.
+#[derive(Default)]
+pub struct Helpers {
+    pub x86_64: Option<Vec<u8>>,
+    pub arm64: Option<Vec<u8>>,
+}
+
+/// How to boot `file`. `conf` is what the helper needs to find the server
+/// and the untouched ISO.
+pub fn plan(file: &File, helpers: &Helpers, conf: &str) -> io::Result<Plan> {
     let records = iso::files(file)?;
     let (mut moved, mut seen) = (Vec::new(), HashSet::new());
     let mut proxmox = None;
@@ -178,9 +185,14 @@ pub fn plan(file: &File, helper: &[u8], conf: &str) -> io::Result<Plan> {
             proxmox = records.iter().find(|r| folder(r) == folder(record) && is_kernel(&r.name())).map(|kernel| (kernel, record));
             continue;
         }
+        let (arch, helper) = if scan.machine == Some(183) { ("ARM64", &helpers.arm64) } else { ("x86-64", &helpers.x86_64) };
+        let Some(helper) = helper else {
+            eprintln!("patch: {} left alone: no helper for {arch} is installed", record.path);
+            continue;
+        };
         // The helper replaces /init and finds the original beside it.
         let mut entries = vec![
-            Added::file("init", 0o755, helper.to_vec()),
+            Added::file("init", 0o755, helper.clone()),
             Added { path: "init.oxi-orig".into(), mode, content: original },
             Added::file("oxi-boot.conf", 0o644, conf.as_bytes().to_vec()),
         ];
@@ -243,16 +255,15 @@ type Slot = (SystemTime, u64, Arc<OnceCell<Arc<Patched>>>);
 /// The patched views, worked out once per ISO and kept until the file changes.
 pub struct Patches {
     config: Arc<Config>,
-    /// The helper program; None if it is not installed, and then nothing is patched.
-    helper: Option<Vec<u8>>,
+    helpers: Arc<Helpers>,
     /// The server as the helper reaches it: "address:port".
     server: String,
     slots: Mutex<HashMap<String, Slot>>,
 }
 
 impl Patches {
-    pub fn new(config: Arc<Config>, helper: Option<Vec<u8>>, server: String) -> Patches {
-        Patches { config, helper, server, slots: Mutex::new(HashMap::new()) }
+    pub fn new(config: Arc<Config>, helpers: Helpers, server: String) -> Patches {
+        Patches { config, helpers: Arc::new(helpers), server, slots: Mutex::new(HashMap::new()) }
     }
 
     /// The view of the ISO at `path` under the ISO folder. `url_path` is the
@@ -271,7 +282,7 @@ impl Patches {
             }
             slot.2.clone()
         };
-        let (helper, name) = (self.helper.clone(), path.to_string());
+        let (helpers, name) = (self.helpers.clone(), path.to_string());
         let attach = match self.config.iso.get(path).and_then(|o| o.attach) {
             Some(Attach::Fuse) => "fuse",
             Some(Attach::Ram) => "ram",
@@ -282,13 +293,12 @@ impl Patches {
             .get_or_try_init(|| async move {
                 tokio::task::spawn_blocking(move || {
                     let file = File::open(full)?;
-                    let planned = helper.map(|helper| plan(&file, &helper, &conf)).transpose().unwrap_or_else(|e| {
-                        eprintln!("patch: {name} served as-is: {e}");
-                        None
-                    });
-                    let Plan { view, direct } = match planned {
-                        Some(plan) => plan,
-                        None => Plan { view: View::unpatched(&file)?, direct: None },
+                    let Plan { view, direct } = match plan(&file, &helpers, &conf) {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            eprintln!("patch: {name} served as-is: {e}");
+                            Plan { view: View::unpatched(&file)?, direct: None }
+                        }
                     };
                     eprintln!("patch: {name} is ready ({})", if view.is_patched() { "patched" } else { "as-is" });
                     Ok::<_, io::Error>(Arc::new(Patched { file, view, direct }))
@@ -309,12 +319,13 @@ mod tests {
     fn initrd_on_the_disc_gets_the_helper() {
         // The test image's initrd is not a real one, so first check it is left alone...
         let file = iso::tests::image("patch-junk");
-        assert!(!plan(&file, b"helper", "conf").unwrap().view.is_patched());
+        let helpers = Helpers { x86_64: Some(b"the helper".to_vec()), arm64: None };
+        assert!(!plan(&file, &helpers, "conf").unwrap().view.is_patched());
 
         // ...then lay a real initrd over it and plan again.
         let real = initrd::archive(&[Added::file("init", 0o755, b"#!/bin/sh\n".to_vec())]).unwrap();
         let file = iso::tests::image_with_initrd("patch-real", &real);
-        let Plan { view, direct } = plan(&file, b"the helper", "10.0.0.1:80\n/iso/a.iso\n").unwrap();
+        let Plan { view, direct } = plan(&file, &helpers, "10.0.0.1:80\n/iso/a.iso\n").unwrap();
         assert!(view.is_patched());
         assert!(direct.is_none()); // no systemd-boot entries on this disc
 
@@ -332,7 +343,7 @@ mod tests {
     fn proxmox_style_initrd_gets_the_iso_inside() {
         let real = initrd::archive(&[Added::file("init", 0o755, b"#!/bin/sh\nmount -o loop /proxmox.iso /mnt\n".to_vec())]).unwrap();
         let file = iso::tests::image_with_initrd("patch-proxmox", &real);
-        let view = plan(&file, b"the helper", "conf").unwrap().view;
+        let view = plan(&file, &Helpers::default(), "conf").unwrap().view; // this patch needs no helper
         let records = iso::tests::files_in_view(&view, &file);
         let initrd = records.iter().find(|r| r.path == "BOOT/INITRD.IMG").unwrap();
         let bytes = view.read(&file, initrd.offset(), initrd.len as usize).unwrap();

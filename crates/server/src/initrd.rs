@@ -21,6 +21,8 @@ pub struct Scan {
     pub lib_is_link: bool,
     /// The kernel version its modules are for.
     pub kernel: Option<String>,
+    /// The machine type in the header of the first program found (183 is ARM64).
+    pub machine: Option<u16>,
 }
 
 const SYMLINK: u32 = 0o120000;
@@ -55,9 +57,16 @@ fn scan_into(reader: &mut dyn BufRead, scan: &mut Scan) -> io::Result<()> {
                     entry.finish()?;
                     break;
                 }
+                // The start of each file, until one is a program and tells the machine type.
+                let mut content = Vec::new();
+                if scan.machine.is_none() && mode & FILE_TYPE == 0o100000 {
+                    (&mut entry).take(20).read_to_end(&mut content)?;
+                    if content.len() == 20 && content.starts_with(b"\x7fELF") {
+                        scan.machine = Some(u16::from_le_bytes([content[18], content[19]]));
+                    }
+                }
                 match name.as_str() {
                     "init" => {
-                        let mut content = Vec::new();
                         entry.read_to_end(&mut content)?;
                         scan.init = Some((mode, content));
                     }
@@ -153,12 +162,14 @@ mod tests {
             Added { path: "lib".into(), mode: SYMLINK | 0o777, content: b"usr/lib".to_vec() },
             Added::file("usr/lib/modules/6.12.0-1-amd64/kernel/drivers/block/nbd.ko.xz", 0o644, vec![0]),
             Added { path: "init".into(), mode: SYMLINK | 0o777, content: b"usr/lib/systemd/systemd".to_vec() },
+            // The start of an ARM64 program: its machine type is the 16-bit number at byte 18.
+            Added::file("usr/bin/busybox", 0o755, [b"\x7fELF".as_slice(), &[0; 14], &[183, 0, 9, 9]].concat()),
         ])
         .unwrap()
     }
 
     fn expected() -> Scan {
-        Scan { init: Some((SYMLINK | 0o777, b"usr/lib/systemd/systemd".to_vec())), has_nbd: true, lib_is_link: true, kernel: Some("6.12.0-1-amd64".into()) }
+        Scan { init: Some((SYMLINK | 0o777, b"usr/lib/systemd/systemd".to_vec())), has_nbd: true, lib_is_link: true, kernel: Some("6.12.0-1-amd64".into()), machine: Some(183) }
     }
 
     #[test]

@@ -109,6 +109,14 @@ fn attach() -> io::Result<String> {
             modprobe(read("modalias").trim());
         }
     }
+    // A virtio card (the usual one in a VM) then shows up on a second bus,
+    // where its network driver has to be asked for too. Device type 1 is a network card.
+    for dev in fs::read_dir("/sys/bus/virtio/devices").into_iter().flatten().flatten() {
+        let alias = fs::read_to_string(dev.path().join("modalias")).unwrap_or_default();
+        if alias.starts_with("virtio:d00000001v") {
+            modprobe(alias.trim());
+        }
+    }
     let interface = retry(100, || {
         fs::read_dir("/sys/class/net").ok()?.flatten().map(|e| e.file_name().into_string().unwrap()).find(|n| n != "lo")
     })

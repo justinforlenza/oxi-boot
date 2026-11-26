@@ -72,7 +72,8 @@ fn boot_file(packet: &Message, ip: Ipv4Addr) -> Option<String> {
     match arch {
         0 => Some("undionly.kpxe".into()),
         7 | 9 => Some("snponly.efi".into()),
-        _ => None, // ARM64 is phase 5
+        11 => Some("snponly-arm64.efi".into()),
+        _ => None,
     }
 }
 
@@ -276,6 +277,7 @@ mod tests {
         let uuid = DhcpOption::ClientMachineIdentifier(vec![0, 9, 9]);
         let uefi = ask([pxe(7), vec![uuid.clone()]].concat(), Request, true).unwrap();
         assert_eq!(file(&uefi), "snponly.efi");
+        assert_eq!(file(&ask(pxe(11), Discover, false).unwrap()), "snponly-arm64.efi");
         assert_eq!(kind(&uefi), Some(Ack));
         assert_eq!(uefi.opts().get(OptionCode::ClientMachineIdentifier), Some(&uuid));
 
@@ -283,7 +285,7 @@ mod tests {
         assert_eq!(file(&ipxe), "http://192.168.1.5/boot.ipxe");
 
         assert!(ask(vec![], Discover, false).is_none()); // an ordinary DHCP client
-        assert!(ask(pxe(11), Discover, false).is_none()); // ARM64
+        assert!(ask(pxe(6), Discover, false).is_none()); // 32-bit x86 UEFI: no iPXE file for it
         assert!(ask(pxe(0), Request, false).is_none()); // meant for the real server
     }
 

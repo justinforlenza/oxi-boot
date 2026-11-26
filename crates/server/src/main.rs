@@ -50,12 +50,16 @@ async fn run(path: &str) -> Result<(), Error> {
         .map_err(|e| format!("TFTP port 69: {e}"))?;
     let listener = tokio::net::TcpListener::bind((iface.ip, 80)).await.map_err(|e| format!("HTTP port 80: {e}"))?;
     // Without the helper program nothing can be patched, and every ISO boots as-is.
-    let helper_path = config.server.ipxe_dir.join("oxi-boot-helper");
-    let helper = std::fs::read(&helper_path).ok();
-    if helper.is_none() {
-        eprintln!("oxi-boot: no helper at {}: ISOs will boot unpatched", helper_path.display());
-    }
-    let patches = Arc::new(patch::Patches::new(config.clone(), helper, format!("{}:80", iface.ip)));
+    let helper = |name: &str, isos: &str| {
+        let path = config.server.ipxe_dir.join(name);
+        let helper = std::fs::read(&path).ok();
+        if helper.is_none() {
+            eprintln!("oxi-boot: no helper at {}: {isos} ISOs will boot unpatched", path.display());
+        }
+        helper
+    };
+    let helpers = patch::Helpers { x86_64: helper("oxi-boot-helper", "x86-64"), arm64: helper("oxi-boot-helper-arm64", "ARM64") };
+    let patches = Arc::new(patch::Patches::new(config.clone(), helpers, format!("{}:80", iface.ip)));
     if !config.server.ipxe_dir.join("wimboot").exists() {
         eprintln!("oxi-boot: no wimboot in {}: Windows ISOs will not boot", config.server.ipxe_dir.display());
     }
