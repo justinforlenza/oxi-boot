@@ -123,7 +123,7 @@ jobs:
           for arch in amd64 arm64; do
             chmod +x dist/$arch/oxi-boot
             cp -r boot dist/$arch/boot
-            cp LICENSE README.md oxi-boot.example.toml docs/licences.md dist/$arch/
+            cp LICENSE README.md oxi-boot.example.toml third-party-licenses.md dist/$arch/
           done
           tar -cf dist.tar dist
 
