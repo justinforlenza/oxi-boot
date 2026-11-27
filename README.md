@@ -115,6 +115,6 @@ On an ARM64 machine, build the server with `--target aarch64-unknown-linux-musl`
 cargo test --workspace
 ```
 
-## Licences
+## Licenses
 
-oxi-boot is MIT. The container image also carries iPXE and wimboot, which are GPL and are shipped as separate, unmodified files. See [third-party-licences.md](third-party-licences.md).
+oxi-boot is MIT. The container image also carries iPXE and wimboot, which are GPL and are shipped as separate, unmodified files. See [third-party-licenses.md](third-party-licenses.md).
