@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  # iPXE and wimboot are shipped as their unmodified upstream release files.
+  # Both are GPL; third-party-licences.md says where their source is.
+  IPXE_VERSION: v2.0.0
+  IPXE_SHA256: 01a526d4cc791fc30362259c609d6c506cc64a7bdff51b9a5eb788354e17eee1
+  WIMBOOT_VERSION: v2.9.0
+  WIMBOOT_SHA256: 5f067ccdc4d084d5bf77b6c853bd0f8402dfc2b4cd1b103d358993ae97fae8e3
+
+jobs:
+  server:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Run the tests
+        run: cargo test --workspace --locked
+
+      - name: Build the server
+        run: cargo build --release --locked -p oxi-boot --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/oxi-boot
+          if-no-files-found: error
+
+  boot-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: helper
+
+      - name: Build the helper for x86-64 clients
+        run: cargo build --release --locked -p oxi-boot-helper --target x86_64-unknown-linux-musl
+
+      - name: Build the helper for ARM64 clients
+        run: cargo build --release --locked -p oxi-boot-helper --target aarch64-unknown-linux-musl
+
+      - name: Download iPXE and wimboot
+        run: |
+          curl -sSfL -o ipxeboot.tar.gz "https://github.com/ipxe/ipxe/releases/download/$IPXE_VERSION/ipxeboot.tar.gz"
+          curl -sSfL -o wimboot "https://github.com/ipxe/wimboot/releases/download/$WIMBOOT_VERSION/wimboot"
+          echo "$IPXE_SHA256  ipxeboot.tar.gz" | sha256sum -c -
+          echo "$WIMBOOT_SHA256  wimboot" | sha256sum -c -
+          tar -xzf ipxeboot.tar.gz
+
+      - name: Collect the boot files
+        run: |
+          mkdir boot
+          cp target/x86_64-unknown-linux-musl/release/oxi-boot-helper boot/
+          cp target/aarch64-unknown-linux-musl/release/oxi-boot-helper boot/oxi-boot-helper-arm64
+          cp ipxeboot/x86_64/undionly.kpxe ipxeboot/x86_64/snponly.efi wimboot boot/
+          cp ipxeboot/arm64/snponly.efi boot/snponly-arm64.efi
+          cat > boot/SOURCES.txt <<TEXT
+          iPXE $IPXE_VERSION and wimboot $WIMBOOT_VERSION, unmodified upstream release files.
+          Source: https://github.com/ipxe/ipxe/tree/$IPXE_VERSION and https://github.com/ipxe/wimboot/tree/$WIMBOOT_VERSION
+          TEXT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: boot
+          path: boot
+          if-no-files-found: error
+
+  package:
+    needs: [server, boot-files]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: server-amd64
+          path: dist/amd64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: server-arm64
+          path: dist/arm64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: boot
+          path: boot
+
+      # Artifacts do not keep the executable bit.
+      - name: Assemble both folders
+        run: |
+          chmod +x boot/oxi-boot-helper*
+          for arch in amd64 arm64; do
+            chmod +x dist/$arch/oxi-boot
+            cp -r boot dist/$arch/boot
+            cp LICENSE README.md oxi-boot.example.toml docs/licences.md dist/$arch/
+          done
+          tar -cf dist.tar dist
+
+      # One tar file, so the executable bits survive the next hand-off.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist.tar
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+
+      - name: Pack the downloads
+        run: |
+          tar -xf dist.tar
+          mv dist/amd64 oxi-boot-${{ github.ref_name }}-x86_64-linux
+          mv dist/arm64 oxi-boot-${{ github.ref_name }}-aarch64-linux
+          tar -czf oxi-boot-${{ github.ref_name }}-x86_64-linux.tar.gz oxi-boot-${{ github.ref_name }}-x86_64-linux
+          tar -czf oxi-boot-${{ github.ref_name }}-aarch64-linux.tar.gz oxi-boot-${{ github.ref_name }}-aarch64-linux
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: oxi-boot-*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  image:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+
+      - name: Unpack the release files
+        run: tar -xf dist.tar
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      # The image only copies files, so both architectures build without emulation.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
