@@ -6,7 +6,7 @@ use std::path::Path;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-use crate::config::{Config, IsoOverride};
+use crate::config::{Builtin, Colours, Config, IsoOverride};
 
 /// Everything but letters, digits and these is escaped in an ISO's URL.
 const URL_PATH: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~').remove(b'/');
@@ -68,6 +68,50 @@ pub fn denied() -> String {
     format!("#!ipxe\necho oxi-boot: this machine is not allowed to network boot\n{LOCAL_DISK}")
 }
 
+/// A section heading: a rule across the menu with `name` in the middle.
+fn rule(name: &str) -> String {
+    format!("item --gap -- {:-^74}\n", format!(" {name} "))
+}
+
+/// A header line as iPXE keeps it. iPXE drops a space after another space or
+/// at the start of the line, and reads ` #` as the start of a comment; those
+/// spaces become no-break spaces. The rest stay, as a no-break space is two bytes.
+fn spaced(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let droppable = matches!(out.chars().last(), None | Some(' ')) || chars.peek() == Some(&'#');
+        out.push(if c == ' ' && droppable { '\u{a0}' } else { c });
+    }
+    out
+}
+
+/// `text` as menu lines, centred as a block.
+fn header(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+    // shortcut: assumes an 80-column screen (entries start at column 3), iPXE does
+    // not tell a script the real width; wider consoles show the header left of centre.
+    let mut pad = (80usize.saturating_sub(width) / 2).saturating_sub(3);
+    // iPXE cuts a line at 74 bytes and a no-break space is two, so a wide header
+    // with many spaces moves left until it fits.
+    let padded = |pad: usize, line: &str| spaced(&format!("{}{line}", " ".repeat(pad)));
+    while pad > 0 && lines.iter().any(|line| padded(pad, line).len() > 74) {
+        pad -= 1;
+    }
+    let mut out = String::new();
+    for line in &lines {
+        match line.is_empty() {
+            true => out.push_str("item --gap\n"),
+            false => writeln!(out, "item --gap -- {}", padded(pad, line)).unwrap(),
+        }
+    }
+    if !out.is_empty() {
+        out.push_str("item --gap\n");
+    }
+    out
+}
+
 /// The whole menu. `base` is the server's URL, without a trailing slash.
 pub fn script(root: &Folder, config: &Config, base: &str) -> String {
     // Folders become labels f0, f1, ... (f0 is the top menu) and ISOs i0, i1, ...
@@ -75,10 +119,16 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
     let mut todo = vec![(root, "f0".to_string(), None::<String>)];
     let (mut folders, mut isos, mut default_item) = (1, 0, String::new());
     while let Some((folder, label, parent)) = todo.pop() {
-        let title = if parent.is_some() { folder.name.as_str() } else { "oxi-boot" };
-        write!(menus, ":{label}\nmenu {title}\n").unwrap();
-        if let Some(parent) = &parent {
-            writeln!(menus, "item {parent} ..").unwrap();
+        let title = if parent.is_some() { folder.name.as_str() } else { config.menu.title.as_str() };
+        writeln!(menus, ":{label}\n{}", format!("menu {title}").trim_end()).unwrap();
+        match &parent {
+            Some(parent) => writeln!(menus, "item {parent} ..").unwrap(),
+            None => {
+                menus.push_str(&header(&config.menu.header));
+                if !root.paths().is_empty() {
+                    menus.push_str(&rule("ISOs"));
+                }
+            }
         }
         for sub in &folder.folders {
             let sub_label = format!("f{folders}");
@@ -110,17 +160,24 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
                 // The timeout can only pick an entry of this menu, so a default
                 // from a folder is also listed here; filled in below.
                 menus.push_str("DEFAULT_ITEM");
-                menus.push_str("item --gap\n");
-                if !root.paths().is_empty() {
-                    menus.push_str("item asis Boot an ISO as-is (unpatched)...\n");
+                let builtins: String = [
+                    (Builtin::AsIs, "item asis Boot an ISO as-is (unpatched)...\n"),
+                    (Builtin::Local, "item local Boot from local disk\n"),
+                    (Builtin::Reboot, "item reboot Reboot\n"),
+                    (Builtin::Firmware, "item firmware Firmware setup\n"),
+                    (Builtin::Shell, "item shell iPXE shell\n"),
+                ]
+                .into_iter()
+                .filter(|(entry, _)| !config.menu.hide.contains(entry) && (*entry != Builtin::AsIs || !root.paths().is_empty()))
+                .map(|(_, item)| item)
+                .collect();
+                if !builtins.is_empty() {
+                    menus.push_str("item --gap\n");
+                    menus.push_str(&rule("Tools"));
+                    menus.push_str(&builtins);
                 }
-                menus.push_str("item local Boot from local disk\nitem reboot Reboot\nitem firmware Firmware setup\nitem shell iPXE shell\n");
-                let timeout = match config.menu.timeout {
-                    0 => String::new(),
-                    seconds => format!("--timeout {} ", seconds * 1000),
-                };
-                // The default may sit in a folder not visited yet; its label is filled in below.
-                writeln!(menus, "choose {timeout}--default DEFAULT target && goto ${{target}} || goto f0").unwrap();
+                // The default may sit in a folder not visited yet; filled in below.
+                menus.push_str("CHOOSE target && goto ${target} || goto f0\n");
             }
         }
     }
@@ -134,9 +191,22 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
         writeln!(boots, ":a{n}\nsanboot {base}/as-is/{} || goto failed", url_path(path)).unwrap();
     }
     menus.push_str("choose target && goto ${target} || goto f0\n");
-    let menus = menus.replace("--default DEFAULT ", &format!("--default {default} ")).replace("DEFAULT_ITEM", &default_item);
+    let choose = match (config.menu.timeout, default == "local" && config.menu.hide.contains(&Builtin::Local)) {
+        // The default is the local disk and its entry is hidden: nothing to time out to.
+        (_, true) => "choose".to_string(),
+        (0, _) => format!("choose --default {default}"),
+        (seconds, _) => format!("choose --timeout {} --default {default}", seconds * 1000),
+    };
+    let menus = menus.replace("CHOOSE target", &format!("{choose} target")).replace("DEFAULT_ITEM", &default_item);
+    let mut colours = String::new();
+    let Colours { text, background, heading, selected_text, selected_background } = config.menu.colours;
+    // Pairs 1 to 3 are the menu's text, its selected entry and its headings.
+    // An iPXE built without the command keeps its own colours.
+    for (pair, fg, bg) in [(1, text, background), (2, selected_text, selected_background), (3, heading, background)] {
+        writeln!(colours, "cpair --foreground {} --background {} {pair} ||", fg as u8, bg as u8).unwrap();
+    }
     format!(
-        "#!ipxe\ngoto f0\n{menus}{boots}\
+        "#!ipxe\n{colours}goto f0\n{menus}{boots}\
          :failed\nprompt Boot failed. Press a key to return to the menu.\ngoto f0\n\
          :reboot\nreboot\n\
          :firmware\nreboot --setup || goto failed\n\
@@ -148,6 +218,9 @@ pub fn script(root: &Folder, config: &Config, base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default colours: black on white, blue headings and selection.
+    const COLOURS: &str = "cpair --foreground 0 --background 7 1 ||\ncpair --foreground 7 --background 4 2 ||\ncpair --foreground 4 --background 7 3 ||\n";
 
     fn config(extra: &str) -> Config {
         crate::config::parse(&format!("[server]\ninterface = \"eth0\"\niso_dir = \"/x\"\n{extra}")).unwrap()
@@ -172,10 +245,10 @@ mod tests {
         assert_eq!(root.folders[0].isos, [("Arch Linux".into(), "linux/arch.iso".into())]);
 
         let script = script(&root, &config, "http://10.0.0.1");
-        assert!(script.starts_with("#!ipxe\ngoto f0\n:f0\nmenu oxi-boot\nitem f1 linux/\nitem i0 a\nitem i1 b tool\nitem i2 Arch Linux\nitem --gap\n")); // the default, from its folder
+        assert!(script.starts_with(&format!("#!ipxe\n{COLOURS}goto f0\n:f0\nmenu\n{}{}item f1 linux/\nitem i0 a\nitem i1 b tool\nitem i2 Arch Linux\nitem --gap\n", header(&config.menu.header), rule("ISOs")))); // the default, from its folder
         assert!(script.contains("choose --timeout 5000 --default i2 target && goto ${target} || goto f0\n"));
         assert!(script.contains(":f1\nmenu linux\nitem f0 ..\nitem i2 Arch Linux\nchoose target"));
-        assert!(script.contains("item --gap\nitem asis Boot an ISO as-is (unpatched)...\nitem local "));
+        assert!(script.contains(&format!("item --gap\n{}item asis Boot an ISO as-is (unpatched)...\nitem local ", rule("Tools"))));
         assert!(script.contains(":i0\nsanboot http://10.0.0.1/as-is/a.iso || goto failed\n")); // as_is in the config
         assert!(script.contains(":i1\nchain http://10.0.0.1/boot/b%20tool.ISO || goto failed\n"));
         assert!(script.contains(":i2\nchain http://10.0.0.1/boot/linux/arch.iso || goto failed\n"));
@@ -184,6 +257,36 @@ mod tests {
         for label in ["local", "reboot", "firmware", "shell", "failed"] {
             assert!(script.contains(&format!("\n:{label}\n")), "{label}");
         }
+    }
+
+    #[test]
+    fn title_hidden_entries_and_colours() {
+        let config = config(
+            "[menu]\ntitle = \"Lab\"\nheader = \"\"\"\n/\\\\ /\\\\\n\n a  b\n\"\"\"\nhide = [\"local\", \"shell\"]\n\
+             [menu.colours]\ntext = \"green\"\nbackground = \"black\"\nselected_text = \"yellow\"\n",
+        );
+        let script = script(&Folder::default(), &config, "http://x");
+        // The header is 5 wide: (80 - 5) / 2 - 3 = 34 columns of padding put it in the middle.
+        let pad = "\u{a0} ".repeat(17);
+        assert!(script.starts_with(&format!(
+            "#!ipxe\ncpair --foreground 2 --background 0 1 ||\ncpair --foreground 3 --background 4 2 ||\ncpair --foreground 4 --background 0 3 ||\n\
+             goto f0\n:f0\nmenu Lab\nitem --gap -- {pad}/\\ /\\\nitem --gap\nitem --gap -- {pad}\u{a0}a \u{a0}b\nitem --gap\n\
+             item --gap\n{}item reboot Reboot\nitem firmware Firmware setup\nchoose target && goto ${{target}} || goto f0\n",
+            rule("Tools")
+        )));
+        assert_eq!(spaced("   # #  #"), "\u{a0} \u{a0}#\u{a0}# \u{a0}#");
+        // Too wide to centre in 74 bytes: it moves left, and every line still fits.
+        let wide = header(&format!("{}\n", "#    ".repeat(10)));
+        assert!(wide.starts_with("item --gap -- \u{a0}") && wide.lines().all(|line| line.len() <= "item --gap -- ".len() + 74));
+        assert_eq!(rule("Tools").trim_end().chars().count(), "item --gap -- ".len() + 74);
+        let all = config_hide_all();
+        assert!(super::script(&Folder::default(), &all, "http://x").starts_with(&format!("#!ipxe\n{COLOURS}goto f0\n:f0\nmenu\n{}choose target", header(&all.menu.header))));
+        // The default header is the logo, centred: 32 wide, so 21 columns of padding before its leading space.
+        assert!(header(&all.menu.header).starts_with(&format!("item --gap -- {}__", "\u{a0} ".repeat(11))));
+    }
+
+    fn config_hide_all() -> Config {
+        config("[menu]\nhide = [\"as_is\", \"local\", \"reboot\", \"firmware\", \"shell\"]\n")
     }
 
     #[test]

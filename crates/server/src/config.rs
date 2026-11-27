@@ -90,18 +90,71 @@ pub enum DhcpMode {
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Menu {
+    /// The heading of the top menu. Empty: none.
+    pub title: String,
+    /// Lines shown above the entries, centred: an ASCII logo, say.
+    pub header: String,
     /// Seconds before the default entry boots; 0 waits forever.
     pub timeout: u64,
     pub default: String,
+    /// Built-in entries to leave out.
+    pub hide: Vec<Builtin>,
+    pub colours: Colours,
 }
 
 impl Default for Menu {
     fn default() -> Self {
-        Self {
-            timeout: 10,
-            default: "local".into(),
-        }
+        let header = r"
+ __            __   __   __  ___
+/  \ \_/ | __ |__) /  \ /  \  |
+\__/ / \ |    |__) \__/ \__/  |
+";
+        Self { title: String::new(), header: header.trim_start_matches('\n').into(), timeout: 10, default: "local".into(), hide: Vec::new(), colours: Colours::default() }
     }
+}
+
+/// The entries under the ISO list.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Builtin {
+    AsIs,
+    Local,
+    Reboot,
+    Firmware,
+    Shell,
+}
+
+/// The menu's colours.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Colours {
+    pub text: Colour,
+    pub background: Colour,
+    /// The header and the section headings.
+    pub heading: Colour,
+    /// The entry the cursor is on.
+    pub selected_text: Colour,
+    pub selected_background: Colour,
+}
+
+impl Default for Colours {
+    fn default() -> Self {
+        Self { text: Colour::Black, background: Colour::White, heading: Colour::Blue, selected_text: Colour::White, selected_background: Colour::Blue }
+    }
+}
+
+/// The eight colours every console has, in iPXE's numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Colour {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
 }
 
 #[derive(Debug, Default, PartialEq, Deserialize)]
@@ -238,6 +291,14 @@ mod tests {
         let config = parse("[server]\ninterface = \"eth0\"\niso_dir = \"/srv/iso\"").unwrap();
         assert_eq!(config.dhcp.mode, DhcpMode::Proxy);
         assert_eq!(config.menu.timeout, 10);
+    }
+
+    #[test]
+    fn menu_looks() {
+        let menu = parse("[menu]\ntitle = \"Lab\"\nhide = [\"as_is\", \"shell\"]\n[menu.colours]\nbackground = \"black\"\n").unwrap().menu;
+        assert_eq!((menu.title.as_str(), menu.hide), ("Lab", vec![Builtin::AsIs, Builtin::Shell]));
+        assert_eq!(menu.colours, Colours { background: Colour::Black, ..Colours::default() });
+        assert!(parse("[menu.colours]\ntext = \"pink\"\n").is_err());
     }
 
     #[test]

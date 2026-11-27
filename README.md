@@ -41,6 +41,12 @@ An argument overrides an environment variable, which overrides the file. In a va
 | `dhcp.router`, `dhcp.dns` | none | `full` mode: what to tell clients, if they need the internet. |
 | `menu.timeout` | `10` | Seconds before the default entry boots. `0` waits forever. |
 | `menu.default` | `local` | `local` boots the client's own disk. Or an ISO's path under `iso_dir`. |
+| `menu.title` | none | A line of text at the very top of the menu. |
+| `menu.header` | the oxi-boot logo | Lines of text shown above the entries, centred: your own ASCII logo, say. `""` removes it. Keep it under about 40 columns; a wider one moves left or is cut off. |
+| `menu.hide` | empty | Built-in entries to leave out: `as_is`, `local`, `reboot`, `firmware`, `shell`. If you hide `local` while it is the default, the menu waits forever. |
+| `menu.colours.text`, `menu.colours.background` | `black`, `white` | The menu's colours: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` or `white`. |
+| `menu.colours.heading` | `blue` | The header and the "ISOs" and "Tools" headings. |
+| `menu.colours.selected_text`, `menu.colours.selected_background` | `white`, `blue` | The entry the cursor is on. |
 | `access.policy` | `allow` | What machines on neither list get: `allow` or `deny`. |
 | `access.allow`, `access.deny` | empty | Lists of MAC addresses. A denied machine boots its own disk. |
 

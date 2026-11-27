@@ -16,6 +16,23 @@ range = "192.168.1.100-192.168.1.200"  # full mode only
 [menu]
 timeout = 10       # seconds, 0 = wait forever
 default = "local"  # or an ISO's path under iso_dir
+# title = "Lab network boot"   # a line at the very top of the menu; default: none
+# Lines shown above the entries, centred. This logo is the default. A line holds 74 bytes,
+# and about half its spaces count double, so keep it under 40 or so columns.
+# header = '''
+#  __            __   __   __  ___
+# /  \ \_/ | __ |__) /  \ /  \  |
+# \__/ / \ |    |__) \__/ \__/  |
+# '''
+# hide = ["as_is", "shell"]     # built-in entries to leave out: as_is, local, reboot, firmware, shell
+
+# Colours: black, red, green, yellow, blue, magenta, cyan or white. These are the defaults.
+# [menu.colours]
+# text = "black"
+# background = "white"
+# heading = "blue"              # the header and the section headings
+# selected_text = "white"
+# selected_background = "blue"
 
 [access]
 policy = "allow"   # what unknown machines get
